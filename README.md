@@ -1,55 +1,39 @@
-# SmartDemon 配音台
+# SmartDemon 配音台 2.1.0
 
-SillyTavern 前端扩展：给聊天消息配音，**可以点任意一句单独播放**。
-合成由 Demon 引擎完成（默认 `http://127.0.0.1:8790`），声线档案、角色绑定、权重切换全部在 Demon 里管理。
+SillyTavern 语音扩展：把角色的台词交给 **Demon** 引擎合成语音，并把朗读进度回传给 Demon 做 Live2D 口型同步。
 
-## 功能
+## 安装（二选一）
 
-- 每条 AI 消息两个按钮：
-  - 🔊 整条朗读（Shift+点 = 换声线，Alt+点 / 右键 = 标注）
-  - ☰ 句子列表：点第 N 句只播第 N 句
-- 自动朗读（可选，默认关）
-- 声线列表从 Demon 自动同步
-- 角色没绑定声线时，回退 Demon 默认声线
-- 播放缓存 / 打断 / 进度显示
+### 方式 A：git clone（推荐，可直接更新）
 
-## 安装
-
-把整个目录放到：
-
-```
-<SillyTavern>/public/scripts/extensions/third-party/smartdemon/
+```bat
+cd <你的 SillyTavern>/public/scripts/extensions/third-party
+git clone https://github.com/<你的账号>/smartdemon-plugin.git smartdemon
 ```
 
-刷新酒馆页面（Ctrl+F5）。
+### 方式 B：下载 ZIP
 
-## 前置条件
+1. 在本仓库页点 `Code → Download ZIP`
+2. 解压后把 `index.js / manifest.json / style.css` 放到：
+   `SillyTavern/public/scripts/extensions/third-party/smartdemon/`
 
-1. Demon 已启动，`http://127.0.0.1:8790/healthz` 返回 ok
-2. Demon 的「语音」页至少有 1 条声线档案
-3. GPT-SoVITS 的 api_v2 已启动（可在 Demon 「启动」页一键拉起）
+装好后刷新酒馆（F5），在「扩展」里启用 **SmartDemon 配音台**。
 
-## 设置
+## 依赖
 
-面板里可改：
+- Demon 引擎（另一仓库）：默认监听 `http://127.0.0.1:8790`
+- SillyTavern：已验证 `release` 分支（commit `8172dcd0e` 附近版本）
 
-| 项 | 默认 | 说明 |
-| --- | --- | --- |
-| Demon 地址 | `http://127.0.0.1:8790` | 引擎监听地址 |
-| 自动朗读 | 关 | 新消息到达后整条朗读 |
-| 去掉动作描写 | 开 | 不朗读 `*微笑*` 这类 |
-| 只读引号内 | 关 | 只朗读对话部分 |
-| 单条最大字数 | 200 | 超出截断 |
+## 本版本改动（2.1.0）
 
-## 开发
+- 请求体新增 `original` 字段：把**未清洗的原文**（含 `（动作描写）` 括号）发给 Demon，用于情绪/动作判定
+- 新增播放事件上报：`POST /voice/playback`（`start` / `tick` / `stop`），让 Live2D 口型跟着真实播放进度走
+- 翻译增加 429 退避重试（3 次，600ms→1560ms），失败自动回退原文合成
 
-- `lib/tts-text.js` 是纯函数（分句、语种判定、缓存键），可以单独在 Node 里测
-- 主逻辑在 `index.js`，通过 `SillyTavern.getContext()` 取上下文
+## 协议说明
 
-## 与旧插件的关系
-
-从 `st-gptsovits5-voice` 改造而来：后端由直连 GPT-SoVITS(9880) 改为调用 Demon(8790)，并新增逐句播放菜单。
-
-## 许可
-
-见 LICENSE。
+| 接口 | 方向 | 说明 |
+|---|---|---|
+| `POST /voice/speak` | 插件 → Demon | `{ text, original, profile, lang, speed }`，返回 WAV |
+| `POST /voice/playback` | 插件 → Demon | `{ phase: start｜tick｜stop, t? }`，`t` 为 `audio.currentTime` |
+| `GET /voice/status` | 插件 → Demon | 服务状态 |

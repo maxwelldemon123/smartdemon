@@ -47,7 +47,7 @@ const DEFAULTS = Object.freeze({
     /** 输出语言：auto = 跟随文本，其余为 GPT-SoVITS 支持的语种 */
     outputLang: 'auto',
     /** 输出语言与文本语言不一致时，先用酒馆当前模型翻译再合成 */
-    translate: false,
+    translate: true,
     splitMethod: 'cut5',
     timeoutMs: 180000,
     fallbackProfileId: '',
@@ -102,6 +102,10 @@ function getSettings() {
     const s = store[MODULE];
     for (const key of Object.keys(DEFAULTS)) {
         if (!Object.hasOwn(s, key)) s[key] = structuredClone(DEFAULTS[key]);
+    }
+    // 已选非「自动」输出语言时，强制开启翻译（旧版本默认关，导致念原文中文）
+    if (s.outputLang && s.outputLang !== 'auto' && s.translate === false) {
+        s.translate = true;
     }
     // 旧版字段迁移：textLang → outputLang
     if (typeof s.textLang === 'string' && s.textLang !== 'auto' && s.outputLang === 'auto') {
@@ -199,13 +203,39 @@ async function translateText(text, target) {
         + 'Keep the tone and emotion. Output ONLY the translated line, no quotes, no notes.\n\n'
         + text;
 
+    // 429 / 5xx 退避重试：主对话和翻译会同时打同一个模型，很容易撞限流
+    const isRetryable = (err) => {
+        const msg = String(err?.message ?? err ?? '');
+        return /429|Too Many Requests|rate.?limit|503|502|500|timeout|ETIMEDOUT/i.test(msg);
+    };
+    const callOnce = () => fn({ quietPrompt: prompt, quietName: 'translate', responseLength: Math.max(64, Math.min(1024, text.length * 3)) });
+
     let out;
-    try {
-        out = await fn({ quietPrompt: prompt, quietName: 'translate', responseLength: Math.max(64, Math.min(1024, text.length * 3)) });
-    } catch (err) {
-        // 老版本签名：generateQuietPrompt(prompt, skipWIAN, responseLength)
-        out = await fn(prompt, true);
+    let lastError = null;
+    for (let attempt = 0; attempt < 3; ++attempt) {
+        try {
+            out = await callOnce();
+            lastError = null;
+            break;
+        } catch (err) {
+            lastError = err;
+            // 老版本签名兜底：generateQuietPrompt(prompt, skipWIAN)
+            if (attempt === 0 && !isRetryable(err)) {
+                try {
+                    out = await fn(prompt, true);
+                    lastError = null;
+                    break;
+                } catch (err2) {
+                    lastError = err2;
+                }
+            }
+            if (!isRetryable(lastError) || attempt === 2) break;
+            const delay = 600 * Math.pow(2.6, attempt);   // 600ms → 1560ms
+            console.warn(`[smartdemon] 翻译限流/失败，${Math.round(delay)}ms 后重试（第 ${attempt + 1} 次）：`, lastError?.message ?? lastError);
+            await new Promise((r) => setTimeout(r, delay));
+        }
     }
+    if (lastError) throw lastError;
 
     const cleaned = String(out ?? '')
         .trim()
@@ -233,8 +263,15 @@ async function synthesize(text, profile, opts, signal) {
     // 目标语言 ≠ 文本语言：要么翻译，要么如实按原文念（不是"换语言"）
     let speakText = text;
     if (target !== detectLang(text)) {
-        if (settings.translate) {
-            speakText = await translateText(text, target);
+        // 只要输出语言不是「自动」，就视为需要翻译（防止旧设置把 translate 覆盖成 false）
+        const effectiveTranslate = settings.translate || (settings.outputLang && settings.outputLang !== 'auto');
+        if (effectiveTranslate) {
+            try {
+                speakText = await translateText(text, target);
+            } catch (err) {
+                console.warn('[smartdemon] 翻译失败，按原文合成：', err);
+                speakText = text;
+            }
         } else {
             console.info(`[GPTSoVITS5] 输出语言=${target} 与文本不一致，未开翻译，按原文合成`);
         }
@@ -255,6 +292,7 @@ async function synthesize(text, profile, opts, signal) {
         // 交给 Demon：只有 text / profile / lang / speed
         const body = {
             text: speakText,
+            original: opts.original ?? text,   // 含括号的原始消息，供 Demon 判断情绪/动作
             profile: profile.id,
             lang: target,
             speed,
@@ -314,15 +352,36 @@ function newSession() {
 
 function guard(p) { p.catch(() => {}); return p; }
 
+// 通知 Demon：音频真正开始/结束播放，用来把口型时间轴对齐到实际播放
+function notifyPlayback(phase, t) {
+    try {
+        fetch(`${baseUrl()}/voice/playback`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ phase, t }),
+        }).catch(() => {});
+    } catch (err) { /* 忽略：对齐失败不影响播放 */ }
+}
+
 function playBlob(blob, s) {
     return new Promise((resolve, reject) => {
         const url = URL.createObjectURL(blob);
         const audio = new Audio(url);
         s.audio = audio;
         const cleanup = () => { URL.revokeObjectURL(url); if (s.audio === audio) s.audio = null; };
-        audio.onended = () => { cleanup(); resolve(); };
-        audio.onerror = () => { cleanup(); reject(new Error('音频播放失败')); };
-        audio.play().catch((err) => { cleanup(); reject(err); });
+        // 播放进度上报：Demon 按 audio.currentTime 取口型帧，避免时间轴漂移
+        let tickTimer = null;
+        const stopTicks = () => { if (tickTimer) { clearInterval(tickTimer); tickTimer = null; } };
+        audio.onended = () => { stopTicks(); notifyPlayback('stop'); cleanup(); resolve(); };
+        audio.onerror = () => { stopTicks(); notifyPlayback('stop'); cleanup(); reject(new Error('音频播放失败')); };
+        audio.onpause = () => { stopTicks(); notifyPlayback('stop'); };
+        audio.play().then(() => {
+            notifyPlayback('start');
+            stopTicks();
+            tickTimer = setInterval(() => {
+                if (!audio.paused && !audio.ended) notifyPlayback('tick', audio.currentTime);
+            }, 120);
+        }).catch((err) => { cleanup(); reject(err); });
     });
 }
 
@@ -367,13 +426,14 @@ async function speak(rawText, cfg, label) {
     const s = newSession();
     setBusy(true);
     try {
-        let pending = guard(synthesize(chunks[0], useCfg.profile, useCfg, s.controller.signal));
+        const synOpts = Object.assign({}, useCfg, { original: rawText });
+        let pending = guard(synthesize(chunks[0], useCfg.profile, synOpts, s.controller.signal));
         for (let i = 0; i < chunks.length; i++) {
             if (s.aborted) break;
             const blob = await pending;
             if (s.aborted) break;
             if (i + 1 < chunks.length) {
-                pending = guard(synthesize(chunks[i + 1], useCfg.profile, useCfg, s.controller.signal));
+                pending = guard(synthesize(chunks[i + 1], useCfg.profile, synOpts, s.controller.signal));
             }
             updateProgress(i + 1, chunks.length);
             await playBlob(blob, s);
@@ -1137,6 +1197,7 @@ function toggleDrawer(force) {
     if (!drawer) return;
     const wrap = drawer.querySelector('.g5-panel-wrap');
     const icon = drawer.querySelector('.g5-icon-toggle');
+    if (!wrap || !icon) return;
     const open = typeof force === 'boolean' ? force : !drawerOpen;
     drawerOpen = open;
     wrap.classList.toggle('g5-open', open);
@@ -1150,19 +1211,12 @@ function injectDrawer() {
     const holder = document.getElementById('top-settings-holder');
     if (!holder) return false;
 
+    // 1.2：配置面板移到 Demon，酒馆顶部不再放耳机图标；
+    // 面板仍构建但隐藏，保证旧的渲染函数有 DOM 可查，内联耳机按钮不受影响。
     const drawer = h('div', { id: DRAWER_ID, class: 'g5-drawer' });
-    const toggle = h('div', {
-        class: 'g5-toggle', title: 'SmartDemon 配音台',
-        onclick: (e) => { e.stopPropagation(); toggleDrawer(); },
-    }, [h('i', { class: 'g5-icon-toggle fa-solid fa-headphones' })]);
-    drawer.append(toggle, h('div', { class: 'g5-panel-wrap' }, [buildPanel()]));
+    drawer.style.display = 'none';
+    drawer.append(h('div', { class: 'g5-panel-wrap' }, [buildPanel()]));
     holder.append(drawer);
-
-    document.addEventListener('click', (e) => {
-        if (!drawerOpen) return;
-        if (drawer.contains(e.target)) return;
-        toggleDrawer(false);
-    });
     return true;
 }
 
@@ -1236,7 +1290,9 @@ if (typeof globalThis.SillyTavern?.getContext === 'function') {
     }, 100);
 }
 
-export async function onActivate() { boot(); }
+export async function onActivate() {
+    console.info('[smartdemon] v2.0.2 loaded, outputLang=', settings?.outputLang, 'translate=', settings?.translate);
+ boot(); }
 
 // 控制台调试
 globalThis.gptsovits5 = {
